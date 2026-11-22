@@ -1,7 +1,12 @@
 /**
- * SnakeBot v1.1.0
+ * SnakeBot v1.2.0
  * Работает БЕЗ перехвата socket: читает snapshot из React fiber,
  * рулит через mousemove/mousedown на canvas (как палец игрока).
+ *
+ * Изменения 1.2.0:
+ * - Собирает ТОЛЬКО синие фрукты (type % 5 === 0, цвет #8ea0ff)
+ * - Сильнее держится от красной стены (увеличин WALL_MARGIN + вес)
+ * - Агрессивнее избегает красных точек/бомб
  *
  * 1. Зайди в матч змейки
  * 2. Вставь скрипт в eruda
@@ -11,26 +16,29 @@
  */
 (function () {
   "use strict";
-  if (window.__SNAKE_BOT__ && window.__SNAKE_BOT__.version === "1.1.0") {
-    console.log("[SnakeBot] already v1.1.0");
+  if (window.__SNAKE_BOT__ && window.__SNAKE_BOT__.version === "1.2.0") {
+    console.log("[SnakeBot] already v1.2.0");
     return;
   }
 
-  var VERSION = "1.1.0";
+  var VERSION = "1.2.0";
   var TAG = "[SnakeBot]";
   var WORLD = 8000;
-  var WALL_MARGIN = 300;
+  var WALL_MARGIN = 480; // было 300 — держимся дальше от красной стены
 
   var cfg = {
     enabled: false,
     peaceful: true,
     attackIfThreatened: true,
     avoidBombs: true,
+    blueOnly: true,          // только синие фрукты
     boostOnFlee: true,
     boostOnHunt: false,
-    fruitWeight: 1.15,
-    avoidWeight: 2.4,
-    wallWeight: 3.2,
+    fruitWeight: 1.25,
+    avoidWeight: 2.6,
+    wallWeight: 4.8,         // сильнее отталкивание от стен
+    bombWeight: 4.2,         // сильнее отталкивание от красных точек
+    bombRange: 280,          // дистанция реакции на бомбы
     huntWeight: 1.3,
     threatRange: 450,
     huntRange: 360,
@@ -222,7 +230,10 @@
     if (!snap || !snap.fruit) return list;
     for (var i = 0; i < snap.fruit.length; i++) {
       var f = snap.fruit[i];
-      list.push({ type: f[1], x: f[2], y: f[3], r: f[4] || 8 });
+      var type = f[1];
+      // blueOnly: FRUIT_COLORS[0] = #8ea0ff (синий)
+      if (cfg.blueOnly && (Math.abs(type) % 5) !== 0) continue;
+      list.push({ type: type, x: f[2], y: f[3], r: f[4] || 8 });
     }
     return list;
   }
@@ -250,11 +261,31 @@
 
     var vx = 0, vy = 0, boost = false, mode = "cruise";
 
-    // walls
-    if (mx < WALL_MARGIN) vx += ((WALL_MARGIN - mx) / WALL_MARGIN) * cfg.wallWeight;
-    if (mx > WORLD - WALL_MARGIN) vx -= ((mx - (WORLD - WALL_MARGIN)) / WALL_MARGIN) * cfg.wallWeight;
-    if (my < WALL_MARGIN) vy += ((WALL_MARGIN - my) / WALL_MARGIN) * cfg.wallWeight;
-    if (my > WORLD - WALL_MARGIN) vy -= ((my - (WORLD - WALL_MARGIN)) / WALL_MARGIN) * cfg.wallWeight;
+    // --- стены (красная граница) — сильнее отталкивание ---
+    var wallPush = cfg.wallWeight;
+    if (mx < WALL_MARGIN) {
+      var t = (WALL_MARGIN - mx) / WALL_MARGIN;
+      vx += t * t * wallPush; // квадратично — чем ближе, тем сильнее
+    }
+    if (mx > WORLD - WALL_MARGIN) {
+      var t2 = (mx - (WORLD - WALL_MARGIN)) / WALL_MARGIN;
+      vx -= t2 * t2 * wallPush;
+    }
+    if (my < WALL_MARGIN) {
+      var t3 = (WALL_MARGIN - my) / WALL_MARGIN;
+      vy += t3 * t3 * wallPush;
+    }
+    if (my > WORLD - WALL_MARGIN) {
+      var t4 = (my - (WORLD - WALL_MARGIN)) / WALL_MARGIN;
+      vy -= t4 * t4 * wallPush;
+    }
+
+    // очень близко к стене — принудительный разворот
+    var hardMargin = 160;
+    if (mx < hardMargin) vx += 8;
+    if (mx > WORLD - hardMargin) vx -= 8;
+    if (my < hardMargin) vy += 8;
+    if (my > WORLD - hardMargin) vy -= 8;
 
     var threat = null;
     for (var si = 0; si < snakes.length; si++) {
@@ -281,13 +312,19 @@
       }
     }
 
+    // --- красные точки / бомбы ---
     if (cfg.avoidBombs) {
+      var bRange = cfg.bombRange || 280;
+      var bW = cfg.bombWeight || 4.2;
       for (var bi2 = 0; bi2 < bombs.length; bi2++) {
         var b = bombs[bi2];
         var dxb = mx - b.x, dyb = my - b.y, db = hypot(dxb, dyb);
-        if (db < 220 && db > 1) {
-          vx += (dxb / db) * 2.6 * (220 - db) / 220;
-          vy += (dyb / db) * 2.6 * (220 - db) / 220;
+        if (db < bRange && db > 1) {
+          var strength = bW * (bRange - db) / bRange;
+          // квадратичное усиление рядом
+          if (db < 120) strength *= 2.2;
+          vx += (dxb / db) * strength;
+          vy += (dyb / db) * strength;
         }
       }
     }
@@ -316,11 +353,17 @@
       for (var fi = 0; fi < fruits.length; fi++) {
         var fr = fruits[fi];
         var dist = hypot(fr.x - mx, fr.y - my);
-        var score = dist - (fr.type === 4 ? 90 : 0);
-        if (fr.x < 160 || fr.x > WORLD - 160 || fr.y < 160 || fr.y > WORLD - 160) score += 140;
+        var score = dist;
+        // бонус за синие уже отфильтрованы, но оставим лёгкий приоритет ближним
+        // штрафуем фрукты у стен и рядом с другими змейками
+        if (fr.x < 220 || fr.x > WORLD - 220 || fr.y < 220 || fr.y > WORLD - 220) score += 180;
         for (var sj = 0; sj < snakes.length; sj++) {
           if (snakes[sj].runId === myId || !snakes[sj].head) continue;
-          if (hypot(fr.x - snakes[sj].head.x, fr.y - snakes[sj].head.y) < 200) score += 220;
+          if (hypot(fr.x - snakes[sj].head.x, fr.y - snakes[sj].head.y) < 200) score += 240;
+        }
+        // штрафуем фрукты рядом с бомбами
+        for (var bj = 0; bj < bombs.length; bj++) {
+          if (hypot(fr.x - bombs[bj].x, fr.y - bombs[bj].y) < 160) score += 300;
         }
         if (score < bestScore) { bestScore = score; best = fr; }
       }
@@ -413,7 +456,7 @@
     applyInput(decision.angle, decision.boost);
     stats.ticks++;
     if (stats.ticks % 10 === 0) {
-      uiStatus(decision.mode + (decision.boost ? " ⚡" : "") + " · t=" + stats.ticks);
+      uiStatus(decision.mode + (decision.boost ? " ⚡" : "") + " · t=" + stats.ticks + (cfg.blueOnly ? " · 🔵" : ""));
     }
   }
 
@@ -429,8 +472,10 @@
       '<div style="display:flex;gap:6px;margin-bottom:6px">' +
       '<button id="sb-start" style="flex:1;padding:6px;border:0;border-radius:8px;background:#2a8;color:#fff;font-weight:700">START</button>' +
       '<button id="sb-stop" style="flex:1;padding:6px;border:0;border-radius:8px;background:#844;color:#fff;font-weight:700">STOP</button></div>' +
-      '<label style="font-size:11px;display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+      '<label style="font-size:11px;display:flex;gap:6px;align-items:center;margin-bottom:4px">' +
       '<input id="sb-peaceful" type="checkbox" checked/> мирный</label>' +
+      '<label style="font-size:11px;display:flex;gap:6px;align-items:center;margin-bottom:6px">' +
+      '<input id="sb-blueonly" type="checkbox" checked/> только синие 🔵</label>' +
       '<div id="sb-log" style="font-size:10px;max-height:110px;overflow:auto;line-height:1.35;opacity:.85"></div>';
     panel.style.cssText =
       "position:fixed;right:8px;bottom:100px;z-index:2147483646;width:190px;padding:10px;" +
@@ -444,6 +489,10 @@
     panel.querySelector("#sb-peaceful").onchange = function (e) {
       cfg.peaceful = !!e.target.checked;
       log("peaceful=" + cfg.peaceful);
+    };
+    panel.querySelector("#sb-blueonly").onchange = function (e) {
+      cfg.blueOnly = !!e.target.checked;
+      log("blueOnly=" + cfg.blueOnly);
     };
   }
   function uiLog(msg, isErr) {
@@ -471,7 +520,7 @@
       tryFindSocket();
       if (timer) clearInterval(timer);
       timer = setInterval(tick, cfg.tickMs);
-      log("START v" + VERSION);
+      log("START v" + VERSION + (cfg.blueOnly ? " (только синие)" : ""));
       // immediate tick
       tick();
       return "started";
@@ -498,6 +547,7 @@
         hasSocket: !!(socket && socket.connected),
         me: snap && snap.me ? { x: snap.me.x, y: snap.me.y, runId: snap.me.runId } : null,
         mode: lastMode,
+        blueOnly: cfg.blueOnly,
         stats: stats,
         lastError: lastError,
       };
@@ -508,5 +558,6 @@
   window.__SNAKE_BOT__ = api;
   ensureUI();
   uiStatus("ready — матч + START");
-  console.log("%c" + TAG + " v" + VERSION + " ready", "color:#6af;font-weight:bold");
+  console.log("%c" + TAG + " v" + VERSION + " ready (blueOnly=" + cfg.blueOnly + ")", "color:#6af;font-weight:bold");
 })();
+        
